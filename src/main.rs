@@ -45,8 +45,8 @@ struct Args {
     #[arg(long, default_value = "jun-27-2026-export-simulation-waveform-")]
     strip_prefix: String,
 
-    /// Deprecated. Reports now render with built-in canvas code and do not require Plotly.
-    /// Accepted for compatibility with older scripts.
+    /// Embed Plotly JS from a local file path. Useful for offline file:// viewing.
+    /// Example: --plotly-js /path/to/plotly.min.js
     #[arg(long)]
     plotly_js: Option<PathBuf>,
 }
@@ -714,11 +714,19 @@ fn make_waveform_row(
 fn generate_html(
     report: &ReportData,
     output_path: &Path,
-    _plotly_js_path: Option<&Path>,
+    plotly_js_path: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload_json = serde_json::to_string(report)?;
 
     let title_escaped = html_escape::encode_text(&report.title).to_string();
+
+    let plotly_script = match plotly_js_path {
+        Some(path) => {
+            let js = fs::read_to_string(path)?;
+            format!("<script>\n{}\n</script>", js)
+        }
+        None => r#"<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>"#.to_string(),
+    };
 
     let template = r##"<!doctype html>
 <html lang="en">
@@ -726,6 +734,7 @@ fn generate_html(
 <meta charset="utf-8">
 <title>__TITLE__</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+__PLOTLY_SCRIPT__
 <style>
 :root {
   --bg: #0f172a;
@@ -778,47 +787,11 @@ label {
 }
 .waveform-shell {
   width: 100%;
-  position: relative;
-  overflow: hidden;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: #0b1220;
+  overflow-x: auto;
 }
-.waveform-wrap {
-  position: relative;
+#plot {
   min-height: 560px;
-}
-#waveform {
-  display: block;
-  width: 100%;
-  height: 560px;
-  cursor: crosshair;
-}
-.empty-state {
-  min-height: 560px;
-  display: grid;
-  place-items: center;
-  color: var(--muted);
-}
-.tooltip {
-  position: fixed;
-  z-index: 10;
-  display: none;
-  max-width: 360px;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #020617;
-  color: var(--text);
-  font-size: 12px;
-  line-height: 1.45;
-  pointer-events: none;
-  box-shadow: 0 10px 30px rgb(0 0 0 / 0.35);
-}
-.hint {
-  color: var(--muted);
-  font-size: 12px;
-  margin-top: 8px;
+  min-width: 980px;
 }
 </style>
 </head>
@@ -840,45 +813,13 @@ label {
       </div>
     </div>
     <div class="waveform-shell">
-      <div class="waveform-wrap">
-        <canvas id="waveform"></canvas>
-        <div id="emptyState" class="empty-state" hidden>No matching waveform rows.</div>
-      </div>
+      <div id="plot"></div>
     </div>
-    <div class="hint">Wheel or trackpad scroll zooms around the cursor. Drag horizontally to pan. Double-click resets the view.</div>
   </section>
 </main>
 
-<div id="tooltip" class="tooltip"></div>
-
 <script>
 const DATA = __PAYLOAD__;
-const canvas = document.getElementById("waveform");
-const ctx = canvas.getContext("2d", { alpha: false });
-const tooltip = document.getElementById("tooltip");
-const emptyState = document.getElementById("emptyState");
-
-const view = {
-  minTime: 0,
-  maxTime: 1,
-  fullMinTime: 0,
-  fullMaxTime: 1,
-  rows: [],
-  hover: null,
-  dragging: false,
-  dragStartX: 0,
-  dragStartMinTime: 0,
-  dragStartMaxTime: 1,
-};
-
-const metrics = {
-  left: 360,
-  right: 24,
-  top: 24,
-  bottom: 54,
-  rowHeight: 42,
-  minHeight: 560,
-};
 
 function escapeAttr(s) {
   return String(s)
@@ -901,12 +842,6 @@ function formatSimulationTime(ps) {
   if (av >= 1_000_000) return `${(v / 1_000_000).toFixed(3).replace(/\.0+$/, "")} us`;
   if (av >= 1_000) return `${(v / 1_000).toFixed(3).replace(/\.0+$/, "")} ns`;
   return `${v} ps`;
-}
-
-function formatValue(point) {
-  if (!point) return "";
-  if (point.hex && point.hex !== "unknown") return `${point.hex} (${point.decimal})`;
-  return point.binary || "unknown";
 }
 
 function shortRowLabel(row) {
@@ -941,332 +876,177 @@ function filteredRows() {
     .slice(0, maxRows);
 }
 
-function visibleTimeRange(rows) {
-  let minTime = Infinity;
-  let maxTime = -Infinity;
-
-  rows.forEach(row => {
-    row.points.forEach(point => {
-      minTime = Math.min(minTime, point.time);
-      maxTime = Math.max(maxTime, point.time);
-    });
-  });
-
-  if (!Number.isFinite(minTime) || !Number.isFinite(maxTime)) {
-    return [0, 1];
+function yFor(row, point, base) {
+  if (row.width === 1 && point.decimal !== null && point.decimal !== undefined) {
+    return base + (point.decimal ? 0.32 : -0.32);
   }
 
-  if (minTime === maxTime) {
-    return [Math.max(0, minTime - 1), maxTime + 1];
-  }
-
-  return [minTime, maxTime];
+  return base;
 }
 
-function syncRows(resetRange) {
+function renderPlot() {
   const rows = filteredRows();
-  view.rows = rows;
 
   if (!rows.length) {
-    emptyState.hidden = false;
-    canvas.hidden = true;
-    tooltip.style.display = "none";
-    draw();
+    Plotly.purge("plot");
+    document.getElementById("plot").innerHTML = "<p>No matching waveform rows.</p>";
     return;
   }
 
-  emptyState.hidden = true;
-  canvas.hidden = false;
+  const traces = [];
+  const tickvals = [];
+  const ticktext = [];
+  const shapes = [];
 
-  const [minTime, maxTime] = visibleTimeRange(rows);
-  view.fullMinTime = minTime;
-  view.fullMaxTime = maxTime;
+  rows.forEach((row, idx) => {
+    const base = rows.length - 1 - idx;
 
-  if (resetRange || view.minTime < minTime || view.maxTime > maxTime || view.minTime >= view.maxTime) {
-    view.minTime = minTime;
-    view.maxTime = maxTime;
-  }
+    tickvals.push(base);
+    ticktext.push(shortRowLabel(row));
 
-  draw();
-}
-
-function resizeCanvas() {
-  const dpr = window.devicePixelRatio || 1;
-  const cssWidth = Math.max(640, canvas.parentElement.clientWidth);
-  const cssHeight = Math.max(metrics.minHeight, view.rows.length * metrics.rowHeight + metrics.top + metrics.bottom);
-
-  canvas.style.height = `${cssHeight}px`;
-  canvas.width = Math.floor(cssWidth * dpr);
-  canvas.height = Math.floor(cssHeight * dpr);
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  draw();
-}
-
-function plotWidth() {
-  return Math.max(1, canvas.clientWidth - metrics.left - metrics.right);
-}
-
-function xForTime(time) {
-  const span = Math.max(1, view.maxTime - view.minTime);
-  return metrics.left + ((time - view.minTime) / span) * plotWidth();
-}
-
-function timeForX(x) {
-  const ratio = (x - metrics.left) / plotWidth();
-  return view.minTime + ratio * (view.maxTime - view.minTime);
-}
-
-function rowCenter(index) {
-  return metrics.top + index * metrics.rowHeight + metrics.rowHeight / 2;
-}
-
-function valueY(row, point, center) {
-  if (row.width === 1 && point.decimal !== null && point.decimal !== undefined) {
-    return center + (point.decimal ? -12 : 12);
-  }
-
-  return center;
-}
-
-function clampRange(minTime, maxTime) {
-  const fullSpan = Math.max(1, view.fullMaxTime - view.fullMinTime);
-  let span = Math.max(1, maxTime - minTime);
-
-  if (span > fullSpan) {
-    span = fullSpan;
-    minTime = view.fullMinTime;
-    maxTime = view.fullMaxTime;
-  }
-
-  if (minTime < view.fullMinTime) {
-    maxTime += view.fullMinTime - minTime;
-    minTime = view.fullMinTime;
-  }
-
-  if (maxTime > view.fullMaxTime) {
-    minTime -= maxTime - view.fullMaxTime;
-    maxTime = view.fullMaxTime;
-  }
-
-  view.minTime = Math.max(view.fullMinTime, minTime);
-  view.maxTime = Math.min(view.fullMaxTime, maxTime);
-}
-
-function drawGrid(width, height) {
-  ctx.fillStyle = "#0b1220";
-  ctx.fillRect(0, 0, width, height);
-
-  ctx.strokeStyle = "#1f2937";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  view.rows.forEach((_, index) => {
-    const y = rowCenter(index);
-    ctx.moveTo(metrics.left, y);
-    ctx.lineTo(width - metrics.right, y);
-  });
-  ctx.stroke();
-
-  ctx.strokeStyle = "#374151";
-  ctx.fillStyle = "#9ca3af";
-  ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-
-  const ticks = 8;
-  for (let i = 0; i <= ticks; i++) {
-    const t = view.minTime + ((view.maxTime - view.minTime) * i / ticks);
-    const x = xForTime(t);
-    ctx.beginPath();
-    ctx.moveTo(x, metrics.top);
-    ctx.lineTo(x, height - metrics.bottom + 10);
-    ctx.stroke();
-    ctx.fillText(formatSimulationTime(Math.round(t)), x, height - metrics.bottom + 18);
-  }
-}
-
-function drawLabels() {
-  ctx.textAlign = "right";
-  ctx.textBaseline = "middle";
-  ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
-
-  view.rows.forEach((row, index) => {
-    ctx.fillStyle = "#e5e7eb";
-    ctx.fillText(shortRowLabel(row), metrics.left - 14, rowCenter(index), metrics.left - 24);
-  });
-}
-
-function visiblePoints(row) {
-  const points = row.points;
-  if (points.length <= 2) return points;
-
-  let start = 0;
-  while (start < points.length - 1 && points[start + 1].time < view.minTime) {
-    start++;
-  }
-
-  let end = start;
-  while (end < points.length && points[end].time <= view.maxTime) {
-    end++;
-  }
-
-  if (end < points.length) end++;
-  return points.slice(start, end);
-}
-
-function drawRows() {
-  ctx.strokeStyle = "#60a5fa";
-  ctx.fillStyle = "#93c5fd";
-  ctx.lineWidth = 2;
-
-  view.rows.forEach((row, index) => {
-    const points = visiblePoints(row);
-    if (!points.length) return;
-
-    const center = rowCenter(index);
-    ctx.beginPath();
-
-    points.forEach((point, pointIndex) => {
-      const x = xForTime(point.time);
-      const y = valueY(row, point, center);
-
-      if (pointIndex === 0) {
-        ctx.moveTo(x, y);
-      } else {
-        const prev = points[pointIndex - 1];
-        const prevY = valueY(row, prev, center);
-        ctx.lineTo(x, prevY);
-        ctx.lineTo(x, y);
-      }
+    shapes.push({
+      type: "line",
+      xref: "paper",
+      x0: 0,
+      x1: 1,
+      y0: base,
+      y1: base,
+      line: {
+        color: "#263244",
+        width: 1,
+      },
     });
 
-    ctx.stroke();
+    const x = row.points.map(point => point.time);
+    const y = row.points.map(point => yFor(row, point, base));
 
-    points.forEach(point => {
-      const x = xForTime(point.time);
-      if (x < metrics.left - 8 || x > canvas.clientWidth - metrics.right + 8) return;
+    const customdata = row.points.map(point => [
+      row.file,
+      row.signal,
+      row.width,
+      point.binary,
+      point.hex,
+      point.decimal,
+      row.timescale,
+      formatSimulationTime(point.time),
+    ]);
 
-      const y = valueY(row, point, center);
-      ctx.beginPath();
-      ctx.arc(x, y, row.width === 1 ? 3 : 4, 0, Math.PI * 2);
-      ctx.fill();
+    traces.push({
+      x,
+      y,
+      customdata,
+      type: "scatter",
+      mode: "lines+markers",
+      line: {
+        shape: "hv",
+        width: 2,
+      },
+      marker: {
+        size: row.width === 1 ? 5 : 7,
+      },
+      showlegend: false,
+      hovertemplate:
+        "file=%{customdata[0]}<br>" +
+        "signal=%{customdata[1]}<br>" +
+        "width=%{customdata[2]}<br>" +
+        "time=%{customdata[7]}<br>" +
+        "binary=%{customdata[3]}<br>" +
+        "hex=%{customdata[4]}<br>" +
+        "decimal=%{customdata[5]}<extra></extra>",
     });
   });
-}
 
-function drawHover(height) {
-  const hover = view.hover;
-  if (!hover) return;
+  const allTimes = rows.flatMap(row => row.points.map(point => point.time));
+  const minTime = Math.min(...allTimes);
+  const maxTime = Math.max(...allTimes);
+  const tickCount = 8;
+  const xTickVals = [];
+  const xTickText = [];
 
-  const x = xForTime(hover.point.time);
-  const y = rowCenter(hover.rowIndex);
-
-  ctx.strokeStyle = "#f59e0b";
-  ctx.fillStyle = "#fbbf24";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(x, metrics.top);
-  ctx.lineTo(x, height - metrics.bottom);
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.arc(x, valueY(hover.row, hover.point, y), 5, 0, Math.PI * 2);
-  ctx.fill();
-}
-
-function draw() {
-  if (!ctx || !canvas.width || !canvas.height) return;
-
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
-  drawGrid(width, height);
-  drawLabels();
-  drawRows();
-  drawHover(height);
-}
-
-function nearestPoint(mouseX, mouseY) {
-  const rowIndex = Math.floor((mouseY - metrics.top) / metrics.rowHeight);
-  if (rowIndex < 0 || rowIndex >= view.rows.length) return null;
-
-  const row = view.rows[rowIndex];
-  const time = timeForX(mouseX);
-  let best = null;
-  let bestDistance = Infinity;
-
-  visiblePoints(row).forEach(point => {
-    const dx = Math.abs(point.time - time);
-    if (dx < bestDistance) {
-      best = point;
-      bestDistance = dx;
+  if (Number.isFinite(minTime) && Number.isFinite(maxTime) && maxTime > minTime) {
+    for (let i = 0; i <= tickCount; i++) {
+      const t = minTime + ((maxTime - minTime) * i / tickCount);
+      xTickVals.push(t);
+      xTickText.push(formatSimulationTime(Math.round(t)));
     }
+  }
+
+  const height = Math.max(560, rows.length * 42 + 180);
+
+  Plotly.newPlot("plot", traces, {
+    height,
+    paper_bgcolor: "#111827",
+    plot_bgcolor: "#111827",
+    font: {
+      color: "#e5e7eb",
+      size: 12,
+    },
+    title: null,
+    xaxis: {
+      title: {
+        text: "Simulation time",
+        standoff: 18,
+      },
+      tickmode: xTickVals.length ? "array" : "auto",
+      tickvals: xTickVals.length ? xTickVals : undefined,
+      ticktext: xTickText.length ? xTickText : undefined,
+      nticks: 10,
+      tickfont: {
+        size: 12,
+      },
+      tickangle: 0,
+      gridcolor: "#374151",
+      zerolinecolor: "#4b5563",
+      showline: true,
+      linecolor: "#9ca3af",
+      mirror: false,
+      side: "bottom",
+      rangemode: "normal",
+      rangeslider: {
+        visible: true,
+        thickness: 0.08,
+      },
+      showspikes: true,
+      spikemode: "across",
+      spikesnap: "cursor",
+      spikecolor: "#f59e0b",
+      spikethickness: 1,
+      spikedash: "solid",
+    },
+    yaxis: {
+      tickmode: "array",
+      tickvals,
+      ticktext,
+      range: [-1, rows.length],
+      automargin: true,
+      tickfont: {
+        size: 11,
+      },
+      gridcolor: "#1f2937",
+      zeroline: false,
+      fixedrange: true,
+      showspikes: true,
+      spikemode: "across",
+      spikesnap: "cursor",
+      spikecolor: "#f59e0b",
+      spikethickness: 1,
+      spikedash: "solid",
+    },
+    hovermode: "closest",
+    hoverdistance: 24,
+    margin: {
+      l: 430,
+      r: 40,
+      t: 20,
+      b: 120,
+      pad: 8,
+    },
+    shapes,
+  }, {
+    responsive: true,
+    displaylogo: false,
+    scrollZoom: true,
   });
-
-  if (!best) return null;
-
-  const pointX = xForTime(best.time);
-  const pointY = valueY(row, best, rowCenter(rowIndex));
-  const pixelDistance = Math.hypot(pointX - mouseX, pointY - mouseY);
-
-  if (pixelDistance > 42) return null;
-  return { row, rowIndex, point: best };
-}
-
-function updateTooltip(event, hover) {
-  if (!hover) {
-    tooltip.style.display = "none";
-    return;
-  }
-
-  tooltip.innerHTML =
-    `<strong>${escapeAttr(hover.row.signal)}</strong><br>` +
-    `file=${escapeAttr(hover.row.file)}<br>` +
-    `time=${escapeAttr(formatSimulationTime(hover.point.time))}<br>` +
-    `binary=${escapeAttr(hover.point.binary)}<br>` +
-    `value=${escapeAttr(formatValue(hover.point))}`;
-  tooltip.style.left = `${event.clientX + 14}px`;
-  tooltip.style.top = `${event.clientY + 14}px`;
-  tooltip.style.display = "block";
-}
-
-function onPointerMove(event) {
-  const rect = canvas.getBoundingClientRect();
-  const x = event.clientX - rect.left;
-  const y = event.clientY - rect.top;
-
-  if (view.dragging) {
-    const dx = x - view.dragStartX;
-    const dt = -(dx / plotWidth()) * (view.dragStartMaxTime - view.dragStartMinTime);
-    clampRange(view.dragStartMinTime + dt, view.dragStartMaxTime + dt);
-    draw();
-    return;
-  }
-
-  view.hover = nearestPoint(x, y);
-  updateTooltip(event, view.hover);
-  draw();
-}
-
-function onWheel(event) {
-  if (!view.rows.length) return;
-  event.preventDefault();
-
-  const rect = canvas.getBoundingClientRect();
-  const x = event.clientX - rect.left;
-  const anchor = timeForX(x);
-  const currentSpan = view.maxTime - view.minTime;
-  const zoom = Math.exp(Math.sign(event.deltaY) * 0.2);
-  const nextSpan = Math.max(1, currentSpan * zoom);
-  const ratio = (anchor - view.minTime) / currentSpan;
-  const minTime = anchor - nextSpan * ratio;
-  const maxTime = minTime + nextSpan;
-
-  clampRange(minTime, maxTime);
-  draw();
-}
-
-function renderPlot(resetRange = true) {
-  syncRows(resetRange);
-  resizeCanvas();
 }
 
 function init() {
@@ -1276,31 +1056,6 @@ function init() {
   document.getElementById("instanceFilter").addEventListener("change", renderPlot);
   document.getElementById("textFilter").addEventListener("input", renderPlot);
   document.getElementById("maxRows").addEventListener("change", renderPlot);
-  window.addEventListener("resize", resizeCanvas);
-  canvas.addEventListener("pointermove", onPointerMove);
-  canvas.addEventListener("pointerleave", () => {
-    view.hover = null;
-    tooltip.style.display = "none";
-    draw();
-  });
-  canvas.addEventListener("pointerdown", event => {
-    const rect = canvas.getBoundingClientRect();
-    view.dragging = true;
-    view.dragStartX = event.clientX - rect.left;
-    view.dragStartMinTime = view.minTime;
-    view.dragStartMaxTime = view.maxTime;
-    canvas.setPointerCapture(event.pointerId);
-  });
-  canvas.addEventListener("pointerup", event => {
-    view.dragging = false;
-    canvas.releasePointerCapture(event.pointerId);
-  });
-  canvas.addEventListener("dblclick", () => {
-    view.minTime = view.fullMinTime;
-    view.maxTime = view.fullMaxTime;
-    draw();
-  });
-  canvas.addEventListener("wheel", onWheel, { passive: false });
 }
 
 init();
@@ -1311,6 +1066,7 @@ init();
 
     let html = template
         .replace("__TITLE__", &title_escaped)
+        .replace("__PLOTLY_SCRIPT__", &plotly_script)
         .replace("__PAYLOAD__", &payload_json);
 
     fs::write(output_path, html)?;

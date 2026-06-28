@@ -6,6 +6,7 @@ MAX_SIGNALS ?= 1000000
 MAX_TRANSITIONS ?= 200000000
 SIGNAL_REGEX ?=
 RECURSIVE ?=
+PLOTLY_JS ?=
 
 BINARY := target/release/vcd_report
 ARGS := $(FOLDER) -o $(OUTPUT) --max-signals-per-file $(MAX_SIGNALS) --max-transitions-per-row $(MAX_TRANSITIONS)
@@ -16,6 +17,10 @@ endif
 
 ifneq ($(strip $(RECURSIVE)),)
 ARGS += --recursive
+endif
+
+ifneq ($(strip $(PLOTLY_JS)),)
+ARGS += --plotly-js "$(PLOTLY_JS)"
 endif
 
 build:
